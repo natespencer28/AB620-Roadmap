@@ -217,6 +217,27 @@ td:first-child{font-weight:600}
 .bar-note{font-size:13px;color:var(--muted);margin-left:auto}
 .notice{max-width:1420px;margin:0 auto;padding:16px var(--gut) 0}
 .notice-in{border:1px solid var(--rule);border-left:4px solid var(--g4);background:var(--panel);border-radius:12px;padding:12px 16px;font-size:14.5px}
+
+/* sync dialog */
+.sync-dlg{border:1px solid var(--rule);border-radius:var(--r);background:var(--panel);color:var(--ink);padding:0;width:min(580px,calc(100vw - 32px));max-height:calc(100vh - 32px);overflow:auto;box-shadow:var(--shadow)}
+.sync-dlg::backdrop{background:rgba(17,16,27,.6)}
+.sd-in{padding:28px 26px 22px;position:relative}
+.sd-in::before{content:"";position:absolute;left:0;right:0;top:0;height:4px;background:var(--grad)}
+.sd-in h2{margin:0 0 8px;font-family:var(--f-display);font-size:23px;line-height:1.25}
+.sd-in p{margin:0 0 12px;font-size:14.5px;color:var(--muted)}
+.sd-in ol{margin:0 0 14px;padding-left:22px;font-size:14.5px}
+.sd-in li{margin-bottom:6px}
+.sd-in input[type=password]{width:100%;font-family:var(--f-mono);font-size:13.5px;padding:10px 12px;border:1px solid var(--rule);border-radius:10px;background:var(--panel2);color:var(--ink)}
+.sd-row{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;align-items:center}
+.sd-btn{font-size:13.5px;font-weight:650;padding:9px 18px;border-radius:99px;border:1px solid var(--rule);background:var(--panel);color:var(--ink);text-decoration:none;display:inline-block;line-height:1.4}
+.sd-btn:hover{border-color:var(--accent);color:var(--accent)}
+.sd-btn.pri{background:var(--ink);color:var(--panel);border-color:var(--ink)}
+.sd-btn.pri:hover{opacity:.88;color:var(--panel)}
+.sd-btn[disabled]{opacity:.55;cursor:default}
+.sd-box{border:1px solid var(--rule);border-left:4px solid var(--done);background:var(--panel2);border-radius:10px;padding:10px 14px;font-size:14.5px;margin:0 0 12px}
+.sd-box.err{border-left-color:#D13438}
+.sd-in input+.sd-box{margin-top:12px}
+.sd-fine{font-size:12.5px !important;margin-top:16px !important}
 .loading{padding:60px var(--gut);text-align:center;color:var(--muted)}
 
 @media (max-width:900px){
@@ -279,6 +300,7 @@ td:first-child{font-weight:600}
 </main>
 
 <div class="bar" id="bar" hidden>
+  <button id="btn-sync" aria-haspopup="dialog">Sync: Off</button>
   <button id="btn-export">Export progress</button>
   <button id="btn-import">Import progress</button>
   <button id="btn-reset" class="danger">Reset everything</button>
@@ -287,6 +309,8 @@ td:first-child{font-weight:600}
   <input type="file" id="file" accept="application/json" hidden>
   <span class="bar-note" id="savenote">Saved locally in this browser</span>
 </div>
+
+<dialog class="sync-dlg" id="syncdlg" aria-labelledby="sd-title"><div class="sd-in" id="sd-body"></div></dialog>
 
 <script>
 (function(){
@@ -602,13 +626,13 @@ td:first-child{font-weight:600}
     P.forEach(function(p){ byKey[p.key] = p; });
     var LAST = W.length ? W[W.length-1].n : 0;
 
-    var state = {checks:{}, notes:{}, sel:"overview", meta:{}};
+    var state = {checks:{}, notes:{}, sel:"overview", meta:{}, ts:{}};
     try {
       var raw = store.get(KEY);
       if(raw){
         var p0 = JSON.parse(raw);
         if(p0 && typeof p0 === "object"){
-          state.checks = p0.checks || {}; state.notes = p0.notes || {}; state.meta = p0.meta || {};
+          state.checks = p0.checks || {}; state.notes = p0.notes || {}; state.meta = p0.meta || {}; state.ts = p0.ts || {};
           state.sel = typeof p0.sel === "string" ? p0.sel : "overview";
         }
       }
@@ -785,14 +809,213 @@ td:first-child{font-weight:600}
       }
     }
     function toggle(id){
-      if(state.checks[id]) delete state.checks[id]; else state.checks[id] = 1;
-      save(); flash(); paintAll();
+      state.checks[id] = state.checks[id] ? 0 : 1;   /* 0 is kept as a tombstone so an un-tick syncs too */
+      commit(["c:"+id]); flash(); paintAll();
     }
     var flashTimer = null;
+    function baseNote(){
+      if(!syncOn()) return "Saved locally in this browser";
+      if(sy.err) return "Saved locally \u00B7 sync problem";
+      return sy.last ? "Saved locally \u00B7 synced " + fmtT(sy.last) : "Saved locally";
+    }
     function flash(){
       if(!store.ok) return;
       var el = $("#savenote"); el.textContent = "Saved";
-      clearTimeout(flashTimer); flashTimer = setTimeout(function(){ el.textContent = "Saved locally in this browser"; }, 1400);
+      clearTimeout(flashTimer); flashTimer = setTimeout(function(){ flashTimer = null; el.textContent = baseNote(); }, 1400);
+    }
+
+    /* ---------- cross-device sync via a secret GitHub Gist ---------- */
+    var SYNC_KEY = "ab620.sync", GFILE = "ab620-progress.json", GDESC = "AB-620 roadmap progress (synced by the study page)";
+    var sy = {token:"", gistId:"", login:"", last:0, err:"", lost:false, busy:false, again:false, timer:null, lastTry:0};
+    try {
+      var sr = store.get(SYNC_KEY), so = sr ? JSON.parse(sr) : null;
+      if(so && so.token && so.gistId){ sy.token = so.token; sy.gistId = so.gistId; sy.login = so.login || ""; sy.last = so.last || 0; }
+    } catch(e){}
+    function syncSave(){ if(sy.token) store.set(SYNC_KEY, JSON.stringify({token:sy.token, gistId:sy.gistId, login:sy.login, last:sy.last})); else store.del(SYNC_KEY); }
+    function syncOn(){ return !!(sy.token && sy.gistId); }
+    function fmtT(ms){ try { return new Date(ms).toLocaleTimeString([], {hour:"numeric", minute:"2-digit"}); } catch(e){ return ""; } }
+
+    /* every data change goes through here: stamp the keys, save, schedule an upload */
+    function commit(keys){
+      var t = Date.now(); keys.forEach(function(k){ state.ts[k] = t; });
+      save(); queue();
+    }
+    function queue(ms){
+      if(!syncOn()) return;
+      clearTimeout(sy.timer); sy.timer = setTimeout(syncNow, ms == null ? 1500 : ms);
+    }
+
+    function api(method, path, body){
+      var opt = {method:method, cache:"no-store", headers:{"Accept":"application/vnd.github+json", "Authorization":"Bearer " + sy.token, "X-GitHub-Api-Version":"2022-11-28"}};
+      if(body){ opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
+      return fetch("https://api.github.com" + path, opt).then(function(r){
+        if(r.ok) return r.json().then(function(j){ return {json:j, scopes:r.headers.get("x-oauth-scopes")}; });
+        var e = new Error("GitHub answered " + r.status); e.status = r.status;
+        return r.json().catch(function(){ return {}; }).then(function(j){ if(j && j.message) e.detail = j.message; throw e; });
+      }, function(){ var e = new Error("offline"); e.status = 0; throw e; });
+    }
+    function errText(e){
+      if(e.status === 401) return "GitHub rejected the token. It may have expired or been revoked. Create a new one and connect again.";
+      if(e.status === 403) return "GitHub refused the request (" + (e.detail || "rate limit or missing gist permission") + ").";
+      if(e.status === 404) return "GitHub could not find that gist or user. If you used a fine-grained token, create a classic one with the link above instead.";
+      if(e.status === 0) return "Could not reach GitHub. Your progress is still saved on this computer and will sync when you are back online.";
+      return "Sync failed: " + (e.detail || e.message);
+    }
+
+    /* data model: checks/notes/meta hold values, ts holds a last-changed time per key ("c:id", "n:id", "m:key") */
+    function clean(o){
+      function obj(x){ return x && typeof x === "object" && !Array.isArray(x) ? x : {}; }
+      o = obj(o); return {checks:obj(o.checks), notes:obj(o.notes), meta:obj(o.meta), ts:obj(o.ts)};
+    }
+    function canon(o){
+      return JSON.stringify(o, function(k, v){
+        if(v && typeof v === "object" && !Array.isArray(v)){ var s = {}; Object.keys(v).sort().forEach(function(x){ s[x] = v[x]; }); return s; }
+        return v;
+      });
+    }
+    function payload(){ var c = clean(state); c.app = "ab620"; c.v = 1; c.updated = new Date().toISOString(); return c; }
+    function merge(a, b){
+      var out = {checks:{}, notes:{}, meta:{}, ts:{}}, T = {c:"checks", n:"notes", m:"meta"};
+      Object.keys(T).forEach(function(t){
+        var f = T[t], ids = {};
+        Object.keys(a[f]).forEach(function(k){ ids[k] = 1; }); Object.keys(b[f]).forEach(function(k){ ids[k] = 1; });
+        Object.keys(ids).forEach(function(id){
+          var kk = t + ":" + id, ha = id in a[f], hb = id in b[f], ta = +a.ts[kk] || 0, tb = +b.ts[kk] || 0, v;
+          if(ha && !hb) v = a[f][id];
+          else if(hb && !ha) v = b[f][id];
+          else if(ta > tb) v = a[f][id];
+          else if(tb > ta) v = b[f][id];
+          else if(t === "c") v = (a[f][id] || b[f][id]) ? 1 : 0;
+          else v = String(b[f][id] || "").length >= String(a[f][id] || "").length ? b[f][id] : a[f][id];
+          out[f][id] = v; if(Math.max(ta, tb) > 0) out.ts[kk] = Math.max(ta, tb);
+        });
+      });
+      return out;
+    }
+
+    function findGist(page){
+      page = page || 1;
+      return api("GET", "/gists?per_page=100&page=" + page).then(function(r){
+        var list = r.json || [];
+        for(var i=0;i<list.length;i++){ if(list[i].files && list[i].files[GFILE]) return list[i].id; }
+        return list.length === 100 && page < 5 ? findGist(page + 1) : "";
+      });
+    }
+    function ensureGist(){
+      if(sy.gistId) return Promise.resolve(sy.gistId);
+      return findGist().then(function(id){
+        if(id) return id;
+        var files = {}; files[GFILE] = {content: JSON.stringify(payload())};
+        return api("POST", "/gists", {description:GDESC, "public":false, files:files}).then(function(r){ return r.json.id; });
+      }).then(function(id){ sy.gistId = id; syncSave(); return id; });
+    }
+
+    function syncNow(){
+      if(!syncOn()) return Promise.resolve();
+      if(sy.busy){ sy.again = true; return Promise.resolve(); }
+      if(noteTimer){ clearTimeout(sy.timer); sy.timer = setTimeout(syncNow, 700); return Promise.resolve(); }  /* a note is mid-save */
+      sy.busy = true; sy.err = ""; sy.lastTry = Date.now(); syncUi();
+      return api("GET", "/gists/" + sy.gistId).then(null, function(e){
+        if(e.status !== 404) throw e;
+        sy.gistId = ""; syncSave();   /* the gist was deleted: find or create another one */
+        return ensureGist().then(function(){ return api("GET", "/gists/" + sy.gistId); });
+      }).then(function(r){
+        var f = r.json.files && r.json.files[GFILE], remote = clean(null);
+        if(f && f.content){ try { remote = clean(JSON.parse(f.content)); } catch(e){} }
+        var mine = clean(state), merged = merge(mine, remote), cm = canon(merged);
+        if(cm !== canon(mine)){ state.checks = merged.checks; state.notes = merged.notes; state.meta = merged.meta; state.ts = merged.ts; save(); paintAll(); }
+        if(cm === canon(remote)) return;
+        var files = {}; files[GFILE] = {content: JSON.stringify(payload())};
+        return api("PATCH", "/gists/" + sy.gistId, {files:files});
+      }).then(function(){
+        sy.last = Date.now(); syncSave();
+      }, function(e){
+        sy.err = errText(e);
+        if(e.status === 401){ sy.token = ""; sy.gistId = ""; sy.lost = true; syncSave(); }
+      }).then(function(){
+        sy.busy = false; syncUi();
+        if(sy.again){ sy.again = false; queue(300); }
+      });
+    }
+
+    var dlg = $("#syncdlg");
+    function syncUi(){
+      var b = $("#btn-sync");
+      b.textContent = "Sync: " + (syncOn() ? (sy.err ? "Error" : sy.busy ? "Syncing\u2026" : "On") : sy.lost ? "Reconnect" : "Off");
+      if(store.ok && !flashTimer) $("#savenote").textContent = baseNote();
+      if(dlg.open) renderDlg();
+    }
+    function renderDlg(){
+      var h = "";
+      var errBox = sy.err ? '<div class="sd-box err" role="alert">' + esc(sy.err) + "</div>" : "";
+      if(!syncOn()){
+        h = '<h2 id="sd-title">Sync across computers</h2>' +
+          "<p>Keep your ticks, notes and scores in step on every computer by saving them to a private gist in your own GitHub account. No other service is involved.</p>" +
+          '<ol><li><a href="https://github.com/settings/tokens/new?scopes=gist&amp;description=AB-620%20roadmap%20sync" target="_blank" rel="noopener">Create a token on GitHub</a>. The gist permission is already ticked. Leave everything else off and pick an expiry you are happy with.</li>' +
+          "<li>Click Generate token, copy it, and paste it here.</li></ol>" +
+          '<input id="sd-token" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your token" aria-label="GitHub token"' + (sy.busy ? " disabled" : "") + ">" +
+          errBox +
+          '<div class="sd-row"><button class="sd-btn pri" id="sd-connect"' + (sy.busy ? " disabled" : "") + ">" + (sy.busy ? "Connecting&hellip;" : "Connect") + '</button><button class="sd-btn" id="sd-close">Close</button></div>' +
+          '<p class="sd-fine">On your other computers, do the same and the page finds your existing gist automatically. The token is kept only in this browser, so connect only on computers you trust, and you can revoke it any time at github.com/settings/tokens. A secret gist is unlisted, not encrypted: anyone who gets its link can read your notes.</p>';
+      } else {
+        h = '<h2 id="sd-title">Sync is on</h2>' +
+          '<div class="sd-box">Connected to GitHub' + (sy.login ? " as <strong>" + esc(sy.login) + "</strong>" : "") + ". " +
+          (sy.busy ? "Syncing&hellip;" : sy.last ? "Last synced at " + esc(fmtT(sy.last)) + "." : "Not synced yet.") + "</div>" +
+          errBox +
+          "<p>Changes you make here upload a moment later, and this page checks for changes from your other computers whenever you come back to the tab.</p>" +
+          '<div class="sd-row"><button class="sd-btn pri" id="sd-now"' + (sy.busy ? " disabled" : "") + '>Sync now</button>' +
+          '<a class="sd-btn" href="https://gist.github.com/' + encodeURIComponent(sy.login || "") + "/" + encodeURIComponent(sy.gistId) + '" target="_blank" rel="noopener">View gist</a>' +
+          '<button class="sd-btn" id="sd-off">Disconnect</button><button class="sd-btn" id="sd-close">Close</button></div>' +
+          '<p class="sd-fine">Disconnect removes the token from this browser only. Your progress stays here and in the gist.</p>';
+      }
+      var keep = $("#sd-token") ? $("#sd-token").value : "";
+      $("#sd-body").innerHTML = h;
+      if($("#sd-token") && keep) $("#sd-token").value = keep;
+    }
+    function connect(){
+      var inp = $("#sd-token"), tok = inp ? inp.value.trim() : "";
+      if(!tok){ sy.err = "Paste the token first."; renderDlg(); return; }
+      sy.token = tok; sy.gistId = ""; sy.login = ""; sy.err = ""; sy.lost = false; sy.busy = true; renderDlg();
+      api("GET", "/user").then(function(r){
+        var sc = r.scopes;
+        if(typeof sc === "string" && sc.split(",").map(function(x){ return x.trim(); }).indexOf("gist") < 0){ var e = new Error("scope"); e.status = -1; throw e; }
+        sy.login = r.json.login || "";
+        return ensureGist();
+      }).then(function(){
+        sy.busy = false; syncSave(); return syncNow();
+      }, function(e){
+        sy.busy = false; sy.token = ""; sy.gistId = ""; syncSave();
+        sy.err = e.status === -1 ? "That token does not have the gist permission. Create it with the link above, which ticks it for you." : errText(e);
+        syncUi();
+      });
+    }
+    $("#btn-sync").addEventListener("click", function(){
+      renderDlg();
+      if(dlg.showModal) dlg.showModal(); else dlg.setAttribute("open", "");
+    });
+    dlg.addEventListener("click", function(ev){
+      var id = ev.target && ev.target.id;
+      if(id === "sd-close" || ev.target === dlg){ if(!syncOn() && !sy.lost) sy.err = ""; dlg.close ? dlg.close() : dlg.removeAttribute("open"); syncUi(); }
+      else if(id === "sd-connect") connect();
+      else if(id === "sd-now") syncNow();
+      else if(id === "sd-off"){ sy.token = ""; sy.gistId = ""; sy.err = ""; sy.lost = false; syncSave(); syncUi(); }
+    });
+    dlg.addEventListener("keydown", function(ev){ if(ev.key === "Enter" && ev.target.id === "sd-token"){ ev.preventDefault(); connect(); } });
+    function pullSoon(){ if(syncOn() && !sy.busy && Date.now() - sy.lastTry > 15000) syncNow(); }
+    document.addEventListener("visibilitychange", function(){ if(!document.hidden) pullSoon(); });
+    window.addEventListener("focus", pullSoon);
+    window.addEventListener("online", function(){ if(syncOn()) syncNow(); });
+    setInterval(function(){ if(!document.hidden) pullSoon(); }, 90000);
+
+    /* replace the whole data set (import, reset) while keeping tombstones so other computers follow */
+    function replaceData(p){
+      p = clean(p); var t = Date.now(), old = state, ns = {checks:{}, notes:{}, meta:{}, ts:{}, sel:"overview"};
+      [["checks","c",0],["notes","n",""],["meta","m",""]].forEach(function(d){
+        var f = d[0], pre = d[1];
+        Object.keys(p[f]).forEach(function(k){ ns[f][k] = f === "checks" ? (p[f][k] ? 1 : 0) : p[f][k]; ns.ts[pre+":"+k] = t; });
+        Object.keys(old[f]).forEach(function(k){ if(!(k in ns[f])){ ns[f][k] = d[2]; ns.ts[pre+":"+k] = t; } });
+      });
+      state = ns; save(); queue();
     }
 
     /* ---------- events ---------- */
@@ -808,6 +1031,7 @@ td:first-child{font-weight:600}
       if(item){ ev.preventDefault(); toggle(item.getAttribute("data-id")); }
     });
     document.addEventListener("keydown", function(ev){
+      if(dlg.open) return;
       var tag = ev.target.tagName || "";
       var item = ev.target.closest ? ev.target.closest(".item") : null;
       if(item && ev.target === item && (ev.key === " " || ev.key === "Enter")){ ev.preventDefault(); toggle(item.getAttribute("data-id")); return; }
@@ -821,11 +1045,11 @@ td:first-child{font-weight:600}
       var el = ev.target;
       if(el.classList && el.classList.contains("notes")){
         clearTimeout(noteTimer);
-        noteTimer = setTimeout(function(){ state.notes[el.getAttribute("data-notes")] = el.value; save(); flash(); }, 400);
+        noteTimer = setTimeout(function(){ var k = el.getAttribute("data-notes"); noteTimer = null; state.notes[k] = el.value; commit(["n:"+k]); flash(); }, 400);
       } else if(el.id === "examdate"){
-        state.meta.date = el.value; save(); flash(); paintTally();
+        state.meta.date = el.value; commit(["m:date"]); flash(); paintTally();
       } else if(el.classList && el.classList.contains("sc")){
-        state.meta[el.getAttribute("data-sc")] = el.value; save(); flash(); paintMeta();
+        var sk = el.getAttribute("data-sc"); state.meta[sk] = el.value; commit(["m:"+sk]); flash(); paintMeta();
       }
     });
     $("#btn-export").addEventListener("click", function(){
@@ -842,16 +1066,16 @@ td:first-child{font-weight:600}
       r.onload = function(){
         try {
           var p = JSON.parse(r.result);
-          state.checks = p.checks || {}; state.notes = p.notes || {}; state.meta = p.meta || {};
-          state.sel = typeof p.sel === "string" && byKey[p.sel] ? p.sel : "overview";
-          save(); paintAll();
+          if(!p || typeof p !== "object" || Array.isArray(p)) throw new Error("bad");
+          var sel0 = typeof p.sel === "string" && byKey[p.sel] ? p.sel : "overview";
+          replaceData(p); state.sel = sel0; save(); paintAll();
         } catch(e){ alert("That file isn't a progress export. Pick the JSON file you downloaded with Export progress."); }
       };
       r.readAsText(f); ev.target.value = "";
     });
     $("#btn-reset").addEventListener("click", function(){
-      if(!confirm("Clear every checkbox, note and score? Export first if you want a copy.")) return;
-      state = {checks:{}, notes:{}, sel:"overview", meta:{}}; store.del(KEY); paintAll();
+      if(!confirm("Clear every checkbox, note and score? If Sync is on, this clears them on your other computers too. Export first if you want a copy.")) return;
+      replaceData(null); paintAll();
     });
 
     function fromHash(){
@@ -860,7 +1084,7 @@ td:first-child{font-weight:600}
     }
     var h0 = fromHash(); if(h0) state.sel = h0;
     if(!byKey[state.sel]) state.sel = "overview";
-    paintAll();
+    paintAll(); syncUi(); if(syncOn()) syncNow();
     window.addEventListener("hashchange", function(){ var k = fromHash(); if(k && k !== state.sel) select(k); });
   }
 
